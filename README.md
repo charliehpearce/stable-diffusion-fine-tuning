@@ -7,6 +7,8 @@ Given a dataset (compressed) and config from storage, a request can be made to `
 
 This approach is highly scalable because any n number of fine train consumers can be started to work off any number of model training requests that could be made from a web client after uploading the dataset and specifying any non-default configuration for example.
 
+Please install git-lfs before pulling repo.
+
 To run, install docker and run the below in the root directory:
 ```
 docker-compose up
