@@ -1,0 +1,12 @@
+redis==4.5.1
+rq==1.12.0
+pydantic==1.10.5
+fastapi==0.92.0
+uvicorn==0.20.0
+accelerate==0.16.0
+torchvision==0.14.1
+datasets==2.9.0
+Jinja2==3.1.2
+aiofiles==23.1.0
+diffusers==0.13.0
+transformers==4.26.1

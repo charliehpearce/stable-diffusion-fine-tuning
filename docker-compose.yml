@@ -1,17 +1,52 @@
 version: "3.9"
 services:
   web:
+    image: synativ_web
     build: .
+    mem_limit: "2g"
     ports:
       - 8001:80
     volumes:
       - ./app/app:/app/app
-      - ./app/mock_storage:app/mock_storage
+      - ./app/data_mount:/tmp/data_mount
     environment:
       - REDIS_HOST
       - REDIS_PORT
       - REDIS_DB
+      - HUGGINGFACE_TOKEN
+    networks:
+      - webnet
+    command: "uvicorn app.main:app --host 0.0.0.0 --port 80"
+    depends_on:
+      - redis
+      
+  fine_tune_consumer:
+    build: .
+    mem_limit: "16g"
+    memswap_limit: "16g"
+    volumes:
+      - ./app/app:/app/app
+      - ./app/data_mount:/tmp/data_mount
+    environment:
+      - REDIS_HOST
+      - REDIS_PORT
+      - REDIS_DB
+      - HUGGINGFACE_TOKEN
+    command: "rq worker fine_tune_queue"
+    networks:
+      - webnet
+    depends_on:
+      - redis
+
+
   redis:
     image: "redis:alpine"
+    mem_limit: "2g"
     ports:
       - 6379:6379
+    networks:
+      - webnet
+
+networks:
+  webnet:
+    name: "web-net"

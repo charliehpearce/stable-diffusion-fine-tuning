@@ -1,8 +1,8 @@
+import logging
 import math
 import os
 import random
 
-import accelerate
 import datasets
 import numpy as np
 import torch
@@ -13,7 +13,6 @@ from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
 from datasets import load_dataset
-from packaging import version
 from torchvision import transforms
 from tqdm.auto import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer
@@ -27,16 +26,21 @@ from diffusers import (
 )
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel
-from diffusers.utils.import_utils import is_xformers_available
 
-from modules.fine_tune_diffuser.config import load_config, StableDiffusionConfig
+from app.constants import DATA_MOUNT_DIR, HUGGINGFACE_TOKEN
+
+from .config import StableDiffusionConfig
+
+# Will error if the minimal version of diffusers is not installed. Remove at your own risks.
+# check_min_version("0.14.0.dev0")
 
 logger = get_logger(__name__, log_level="INFO")
 
 
-def main():
-    #  Load config
-    config = load_config(StableDiffusionConfig.TRAIN_1)
+def main(config: StableDiffusionConfig, dataset_uuid: str):
+    output_dir = os.path.join(DATA_MOUNT_DIR, "models", dataset_uuid)
+
+    logging_dir = os.path.join(output_dir, "logging")
 
     accelerator_project_config = ProjectConfiguration(
         total_limit=config.checkpoints_total_limit
@@ -45,9 +49,18 @@ def main():
     accelerator = Accelerator(
         gradient_accumulation_steps=config.gradient_accumulation_steps,
         mixed_precision=config.mixed_precision,
+        log_with=config.report_to,
+        logging_dir=logging_dir,
         project_config=accelerator_project_config,
     )
 
+    # Make one log on every process with the configuration for debugging.
+    logging.basicConfig(
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+        datefmt="%m/%d/%Y %H:%M:%S",
+        level=logging.INFO,
+    )
+    logger.info(accelerator.state, main_process_only=False)
     if accelerator.is_local_main_process:
         datasets.utils.logging.set_verbosity_warning()
         transformers.utils.logging.set_verbosity_warning()
@@ -61,27 +74,38 @@ def main():
     if config.seed is not None:
         set_seed(config.seed)
 
+    # Handle the repository creation
+    os.makedirs(output_dir, exist_ok=True)
+
     # Load scheduler, tokenizer and models.
     noise_scheduler = DDPMScheduler.from_pretrained(
-        config.pretrained_model_name_or_path, subfolder="scheduler"
+        config.pretrained_model_name_or_path,
+        subfolder="scheduler",
+        use_auth_token=HUGGINGFACE_TOKEN,
     )
     tokenizer = CLIPTokenizer.from_pretrained(
         config.pretrained_model_name_or_path,
         subfolder="tokenizer",
         revision=config.revision,
+        use_auth_token=HUGGINGFACE_TOKEN,
     )
     text_encoder = CLIPTextModel.from_pretrained(
         config.pretrained_model_name_or_path,
         subfolder="text_encoder",
         revision=config.revision,
+        use_auth_token=HUGGINGFACE_TOKEN,
     )
     vae = AutoencoderKL.from_pretrained(
-        config.pretrained_model_name_or_path, subfolder="vae", revision=config.revision
+        config.pretrained_model_name_or_path,
+        subfolder="vae",
+        revision=config.revision,
+        use_auth_token=HUGGINGFACE_TOKEN,
     )
     unet = UNet2DConditionModel.from_pretrained(
         config.pretrained_model_name_or_path,
         subfolder="unet",
         revision=config.non_ema_revision,
+        use_auth_token=HUGGINGFACE_TOKEN,
     )
 
     # Freeze vae and text_encoder
@@ -94,6 +118,7 @@ def main():
             config.pretrained_model_name_or_path,
             subfolder="unet",
             revision=config.revision,
+            use_auth_token=HUGGINGFACE_TOKEN,
         )
         ema_unet = EMAModel(
             ema_unet.parameters(),
@@ -101,58 +126,41 @@ def main():
             model_config=ema_unet.config,
         )
 
-    if config.enable_xformers_memory_efficient_attention:
-        if is_xformers_available():
-            import xformers
+    # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
+    def save_model_hook(models, weights, output_dir):
+        if config.use_ema:
+            ema_unet.save_pretrained(os.path.join(output_dir, "unet_ema"))
 
-            xformers_version = version.parse(xformers.__version__)
-            if xformers_version == version.parse("0.0.16"):
-                logger.warn(
-                    "xFormers 0.0.16 cannot be used for training in some GPUs. If you observe problems during training, please update xFormers to at least 0.0.17. See https://huggingface.co/docs/diffusers/main/en/optimization/xformers for more details."
-                )
-            unet.enable_xformers_memory_efficient_attention()
-        else:
-            raise ValueError(
-                "xformers is not available. Make sure it is installed correctly"
+        for i, model in enumerate(models):
+            model.save_pretrained(os.path.join(output_dir, "unet"))
+
+            # make sure to pop weight so that corresponding model is not saved again
+            weights.pop()
+
+    def load_model_hook(models, input_dir):
+        if config.use_ema:
+            load_model = EMAModel.from_pretrained(
+                os.path.join(input_dir, "unet_ema"), UNet2DConditionModel
             )
+            ema_unet.load_state_dict(load_model.state_dict())
+            ema_unet.to(accelerator.device)
+            del load_model
 
-    # `accelerate` 0.16.0 will have better support for customized saving
-    if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
-        # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
-        def save_model_hook(models, weights, output_dir):
-            if config.use_ema:
-                ema_unet.save_pretrained(os.path.join(output_dir, "unet_ema"))
+        for i in range(len(models)):
+            # pop models so that they are not loaded again
+            model = models.pop()
 
-            for i, model in enumerate(models):
-                model.save_pretrained(os.path.join(output_dir, "unet"))
+            # load diffusers style into model
+            load_model = UNet2DConditionModel.from_pretrained(
+                input_dir, subfolder="unet"
+            )
+            model.register_to_config(**load_model.config)
 
-                # make sure to pop weight so that corresponding model is not saved again
-                weights.pop()
+            model.load_state_dict(load_model.state_dict())
+            del load_model
 
-        def load_model_hook(models, input_dir):
-            if config.use_ema:
-                load_model = EMAModel.from_pretrained(
-                    os.path.join(input_dir, "unet_ema"), UNet2DConditionModel
-                )
-                ema_unet.load_state_dict(load_model.state_dict())
-                ema_unet.to(accelerator.device)
-                del load_model
-
-            for i in range(len(models)):
-                # pop models so that they are not loaded again
-                model = models.pop()
-
-                # load diffusers style into model
-                load_model = UNet2DConditionModel.from_pretrained(
-                    input_dir, subfolder="unet"
-                )
-                model.register_to_config(**load_model.config)
-
-                model.load_state_dict(load_model.state_dict())
-                del load_model
-
-        accelerator.register_save_state_pre_hook(save_model_hook)
-        accelerator.register_load_state_pre_hook(load_model_hook)
+    accelerator.register_save_state_pre_hook(save_model_hook)
+    accelerator.register_load_state_pre_hook(load_model_hook)
 
     if config.gradient_checkpointing:
         unet.enable_gradient_checkpointing()
@@ -170,18 +178,7 @@ def main():
             * accelerator.num_processes
         )
 
-    # Initialize the optimizer
-    if config.use_8bit_adam:
-        try:
-            import bitsandbytes as bnb
-        except ImportError:
-            raise ImportError(
-                "Please install bitsandbytes to use 8-bit Adam. You can do so by running `pip install bitsandbytes`"
-            )
-
-        optimizer_cls = bnb.optim.AdamW8bit
-    else:
-        optimizer_cls = torch.optim.AdamW
+    optimizer_cls = torch.optim.AdamW
 
     optimizer = optimizer_cls(
         unet.parameters(),
@@ -197,15 +194,19 @@ def main():
     # In distributed training, the load_dataset function guarantees that only one local process can concurrently
     # download the dataset.
 
-    # TODO: HANDLE dataset loading here from storage
     data_files = {}
-    if config.train_data_dir is not None:
-        data_files["train"] = os.path.join(config.train_data_dir, "**")
+    logger.info("loading dataset")
+    data_files["train"] = os.path.join(
+        DATA_MOUNT_DIR, "datasets", f"{dataset_uuid}.tar.gz"
+    )
     dataset = load_dataset(
         "imagefolder",
         data_files=data_files,
         cache_dir=config.cache_dir,
     )
+
+    # See more about loading custom images at
+    # https://huggingface.co/docs/datasets/v2.4.0/en/image_load#imagefolder
 
     # Preprocessing the datasets.
     # We need to tokenize inputs and targets.
@@ -343,8 +344,6 @@ def main():
 
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
-    if accelerator.is_main_process:
-        accelerator.init_trackers("text2image-fine-tune", config=vars(config))
 
     # Train!
     total_batch_size = (
@@ -365,33 +364,6 @@ def main():
     global_step = 0
     first_epoch = 0
 
-    # Potentially load in the weights and states from a previous save
-    if config.resume_from_checkpoint:
-        if config.resume_from_checkpoint != "latest":
-            path = os.path.basename(config.resume_from_checkpoint)
-        else:
-            # Get the most recent checkpoint
-            dirs = os.listdir(config.output_dir)
-            dirs = [d for d in dirs if d.startswith("checkpoint")]
-            dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))
-            path = dirs[-1] if len(dirs) > 0 else None
-
-        if path is None:
-            accelerator.print(
-                f"Checkpoint '{config.resume_from_checkpoint}' does not exist. Starting a new training run."
-            )
-            config.resume_from_checkpoint = None
-        else:
-            accelerator.print(f"Resuming from checkpoint {path}")
-            accelerator.load_state(os.path.join(config.output_dir, path))
-            global_step = int(path.split("-")[1])
-
-            resume_global_step = global_step * config.gradient_accumulation_steps
-            first_epoch = global_step // num_update_steps_per_epoch
-            resume_step = resume_global_step % (
-                num_update_steps_per_epoch * config.gradient_accumulation_steps
-            )
-
     # Only show the progress bar once on each machine.
     progress_bar = tqdm(
         range(global_step, config.max_train_steps),
@@ -403,16 +375,6 @@ def main():
         unet.train()
         train_loss = 0.0
         for step, batch in enumerate(train_dataloader):
-            # Skip steps until we reach the resumed step
-            if (
-                config.resume_from_checkpoint
-                and epoch == first_epoch
-                and step < resume_step  # type: ignore
-            ):
-                if step % config.gradient_accumulation_steps == 0:
-                    progress_bar.update(1)
-                continue
-
             with accelerator.accumulate(unet):
                 # Convert images to latent space
                 latents = vae.encode(
@@ -475,16 +437,7 @@ def main():
                     ema_unet.step(unet.parameters())
                 progress_bar.update(1)
                 global_step += 1
-                accelerator.log({"train_loss": train_loss}, step=global_step)
                 train_loss = 0.0
-
-                if global_step % config.checkpointing_steps == 0:
-                    if accelerator.is_main_process:
-                        save_path = os.path.join(
-                            config.output_dir, f"checkpoint-{global_step}"
-                        )
-                        accelerator.save_state(save_path)
-                        logger.info(f"Saved state to {save_path}")
 
             logs = {
                 "step_loss": loss.detach().item(),
@@ -508,7 +461,8 @@ def main():
             vae=vae,
             unet=unet,
             revision=config.revision,
+            use_auth_token=HUGGINGFACE_TOKEN,
         )
-        pipeline.save_pretrained(config.output_dir)
+        pipeline.save_pretrained(output_dir)
 
-    accelerator.end_training()
+    return True

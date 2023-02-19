@@ -1,5 +1,6 @@
 from pydantic import BaseModel
 
 
-class VersionRequest(BaseModel):
-    pass
+class FineTuneStableDiffusionRequest(BaseModel):
+    dataset_uuid: str
+    config_uuid: str
