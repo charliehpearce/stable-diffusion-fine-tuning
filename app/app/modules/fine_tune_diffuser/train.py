@@ -29,7 +29,7 @@ from diffusers.training_utils import EMAModel
 
 from app.constants import DATA_MOUNT_DIR, HUGGINGFACE_TOKEN
 
-from .config import StableDiffusionConfig
+from .config_model import StableDiffusionConfig
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 # check_min_version("0.14.0.dev0")

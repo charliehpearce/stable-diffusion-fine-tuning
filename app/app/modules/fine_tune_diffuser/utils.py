@@ -1,6 +1,6 @@
 import json
 import os
-from constants import DATA_MOUNT_DIR
+from app.constants import DATA_MOUNT_DIR
 from .config_model import StableDiffusionConfig
 
 

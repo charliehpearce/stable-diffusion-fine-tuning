@@ -1,6 +1,6 @@
 import asyncio
 from .train import main
-from .config import load_config
+from .utils import load_config
 
 
 class DiffusionPipeline:
